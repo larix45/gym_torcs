@@ -1017,45 +1017,121 @@ STATUS_REWARD = None
 MINIMUM_EPSILON = 0.01
 # Epsilon decay rate: multiply by this each episode for exponential decay
 EPSILON_DECAY_RATE = 0.98
+# Global training step counter file for proper exploration tracking across sessions
+GLOBAL_STEPS_FILE = '.training_global_steps.json'
+
+
+def load_global_steps():
+    """Load global episode counter (completed episodes) from file. Returns 0 if file doesn't exist."""
+    import json
+    try:
+        with open(GLOBAL_STEPS_FILE, 'r') as f:
+            data = json.load(f)
+            # Key changed to 'global_episodes' to store completed episodes
+            return data.get('global_episodes', 0)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return 0
+
+
+def save_global_steps(global_episodes):
+    """Save global episode counter to file."""
+    import json
+    try:
+        with open(GLOBAL_STEPS_FILE, 'w') as f:
+            json.dump({'global_episodes': global_episodes}, f)
+    except (IOError, OSError) as e:
+        print(f'Warning: Could not save global episodes: {e}')
 
 
 def compute_reward(S, prev_S=None):
-    reward = S['speedX'] * np.cos(S['angle'])
+    """
+    Reward function heavily weighted toward:
+    1. Distance traveled on valid track
+    2. Staying centered and away from walls
+    3. Smooth steering
+    """
+    reward = 0.0
     invalid = False
-    delta_dist = 0.0
-    reward += S['distRaced'] * ABSOLUTE_DISTANCE_REWARD_MULTIPLIER
-    if prev_S is not None:
+    
+    # Check if current state is on track
+    on_track = min(S['track']) >= 0 and abs(S['trackPos']) <= 1.0
+    
+    # PRIMARY REWARD: Distance traveled on valid track (most important!)
+    if on_track:
+        # Base speed reward: moving forward is good
+        driving_direction = np.cos(S['angle'])
+        if driving_direction > 0:  # Only reward forward progress
+            reward += S['speedX'] * driving_direction * 2.0  # Increased from 1x to 2x
+    
+    if prev_S is not None and on_track:
+        # Distance traveled while on track
         delta_dist = S['distFromStart'] - prev_S['distFromStart']
-        reward += delta_dist * DISTANCE_REWARD_MULTIPLIER
-        if delta_dist < 0.01 and S['speedX'] < 1.0:
-            reward += STANDSTILL_PENALTY
-        elif delta_dist < SLOW_MOVEMENT_DISTANCE_THRESHOLD or S['speedX'] < SLOW_MOVEMENT_SPEED_THRESHOLD:
-            reward += SLOW_MOVEMENT_PENALTY
-
-    track_pos_penalty = INVALID_TRACK_POS_PENALTY * abs(S['trackPos'])
-    reward += track_pos_penalty
-
+        if delta_dist > 0:
+            reward += delta_dist * 1000.0  # Heavily increased from 600 to 1000!
+        else:
+            # Penalty for not moving forward
+            reward -= 50.0
+    
+    # SECONDARY: Absolute race distance (only matters if on track)
+    if on_track:
+        reward += S['distRaced'] * 50.0  # Increased from 10 to 50
+    
+    # STEERING PENALTY: Penalize sharp turns (harsh steering = going off track)
+    angle_magnitude = abs(S['angle'])
+    if angle_magnitude > 0.2:
+        # Steep angle = trying to turn too sharply
+        steering_penalty = (angle_magnitude - 0.2) * 500.0  # NEW: sharp turns are bad
+        reward -= steering_penalty
+    
+    # TRACK POSITION: Heavy penalty for being off-center (should be on track)
+    track_pos_penalty = abs(S['trackPos']) * 200.0  # Increased from 20 to 200!
+    reward -= track_pos_penalty
+    
+    # WALL PROXIMITY: Severe penalty for getting too close to walls
     closest_wall = min(S['track'])
     if closest_wall < WALL_PROXIMITY_THRESHOLD:
         proximity_factor = max(0.0, (WALL_PROXIMITY_THRESHOLD - closest_wall) / WALL_PROXIMITY_THRESHOLD)
-        reward += WALL_PROXIMITY_PENALTY * proximity_factor
-
+        # Scale penalty based on how close
+        wall_penalty = WALL_PROXIMITY_PENALTY * proximity_factor
+        reward += wall_penalty  # This is negative
+    
+    # COLLISION/DAMAGE: Severe penalty
     if prev_S is not None and 'damage' in S and 'damage' in prev_S:
         if S['damage'] > prev_S['damage']:
-            reward -= 10000.0
+            reward -= 50000.0  # Massive penalty for hitting things
             invalid = True
-
-    if min(S['track']) < 0 or abs(S['trackPos']) > 1.0:
-        reward += INVALID_TIME_PENALTY
+    
+    # OFF-TRACK DETECTION: Severe penalties
+    if min(S['track']) < 0:
+        # Hit grass/wall
+        reward -= 10000.0
         invalid = True
+    
+    if abs(S['trackPos']) > 1.0:
+        # Completely off track sideways
+        reward -= 10000.0
+        invalid = True
+    
     if np.cos(S['angle']) < 0:
-        reward += INVALID_ANGLE_PENALTY
+        # Driving backwards
+        reward -= 50000.0
         invalid = True
-
+    
     if abs(S['angle']) > 1.0 and S['speedX'] > 20:
-        reward += INVALID_SPEED_PENALTY
-
+        # Too angled while going fast
+        reward -= 5000.0
+        invalid = True
+    
+    # Slow movement penalty (but not as harsh if tracking position is good)
+    if prev_S is not None:
+        delta_dist = S['distFromStart'] - prev_S['distFromStart']
+        if delta_dist < 0.01 and S['speedX'] < 1.0:
+            reward -= 100.0  # Stalled
+        elif delta_dist < SLOW_MOVEMENT_DISTANCE_THRESHOLD or S['speedX'] < SLOW_MOVEMENT_SPEED_THRESHOLD:
+            reward -= 30.0  # Too slow
+    
     return reward, invalid
+
 
 
 def is_invalid_state(S):
@@ -1238,12 +1314,13 @@ if __name__ == "__main__":
         print('No Q-networks available for qlearn mode; falling back to modular control.')
         C.mode = 'modular'
 
+    # Load global episode counter for proper exploration tracking across training sessions
+    global_episodes = load_global_steps() if C.train else 0
 
     for episode in range(C.maxEpisodes):
-        # Implement exponential epsilon decay for better exploration-exploitation tradeoff
-        max_epsilon = max(MINIMUM_EPSILON, C.epsilon * (EPSILON_DECAY_RATE ** episode))
-        # Each episode uses the current max_epsilon (no randomization per episode)
-        episode_epsilon = max_epsilon
+        # Calculate epsilon based on TOTAL completed episodes across all sessions
+        # This prevents resetting epsilon when batches are run in separate processes
+        episode_epsilon = max(MINIMUM_EPSILON, C.epsilon * (EPSILON_DECAY_RATE ** global_episodes))
         stall_start_dist = C.S.d.get('distRaced', C.S.d['distFromStart'])
         stall_steps = 0
         STATUS_CURRENT_EPISODE = episode + 1
@@ -1376,6 +1453,10 @@ if __name__ == "__main__":
                 restart_race(C)
                 break
 
+        # Increment global episode counter after each episode completes
+        if C.train:
+            global_episodes += 1  # Count this completed episode
+
         if C.mode != 'qlearn' or not C.train:
             # if we are not training, we only run one episode
             break
@@ -1399,6 +1480,11 @@ if __name__ == "__main__":
             if gear_net is not None:
                 gear_net.save(gear_file)
                 print('Saved gear model to %s' % gear_file)
+
+    # Save global episode counter for exploration tracking across training sessions
+    if C.train:
+        save_global_steps(global_episodes)
+        print(f'Saved global training episodes: {global_episodes}')
 
     C.shutdown()
     if C.train:

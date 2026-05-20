@@ -84,13 +84,13 @@ run_stage() {
 }
 
 echo "Stage 1: Train steer with fixed throttle and fixed gear"
-run_stage "Steer training" "--train-steer --fixed-throttle --fixed-gear" "--save-model --steer-model-file $STEER_MODEL"
+run_stage "Steer training" "--train-steer --fixed-throttle --fixed-gear" "--load-model --save-model --steer-model-file $STEER_MODEL"
 
 echo "Stage 2: Train throttle using trained steer model and fixed gear"
-run_stage "Throttle training" "--train-throttle --load-model --steer-model-file $STEER_MODEL --fixed-gear" "--save-model --throttle-model-file $THROTTLE_MODEL"
+run_stage "Throttle training" "--train-throttle --load-model --steer-model-file $STEER_MODEL --fixed-gear" "--load-model --save-model --steer-model-file $STEER_MODEL --throttle-model-file $THROTTLE_MODEL"
 
 echo "Stage 3: Train gear using trained steer and throttle models"
-run_stage "Gear training" "--train-gear --load-model --steer-model-file $STEER_MODEL --throttle-model-file $THROTTLE_MODEL" "--save-model --gear-model-file $GEAR_MODEL"
+run_stage "Gear training" "--train-gear --load-model --steer-model-file $STEER_MODEL --throttle-model-file $THROTTLE_MODEL" "--load-model --save-model --steer-model-file $STEER_MODEL --throttle-model-file $THROTTLE_MODEL --gear-model-file $GEAR_MODEL"
 
 echo "Training sequence completed: $(date)"
 
