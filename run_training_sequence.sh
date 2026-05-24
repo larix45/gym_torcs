@@ -19,16 +19,19 @@ rm -f "$REPORT_FILE" "$REWARD_FILE"
 touch "$REWARD_FILE"
 
 open_reward_monitor() {
+  local monitor_cmd="cd \"$PWD\" && python3 -u reward_monitor.py \"$REPORT_FILE\""
   if command -v xfce4-terminal >/dev/null 2>&1; then
-    xfce4-terminal --title "TORCS Reward Monitor" --geometry=80x6 \
-      --command "bash -lc 'tail -n 1 -f \"$PWD/$REWARD_FILE\"'" --always-on-top >/dev/null 2>&1 &
+    xfce4-terminal --hold --title "TORCS Reward Monitor" --geometry=100x30 \
+      --command "bash -lc '$monitor_cmd; echo "--- Reward monitor exited ---"; read -r'" >/dev/null 2>&1 &
     disown
   elif command -v xterm >/dev/null 2>&1; then
-    xterm -T "TORCS Reward Monitor" -geometry 80x6 \
-      -e "bash -lc 'tail -n 1 -f \"$PWD/$REWARD_FILE\"'" >/dev/null 2>&1 &
+    xterm -hold -T "TORCS Reward Monitor" -geometry 100x30 \
+      -e "bash -lc '$monitor_cmd; echo \"--- Reward monitor exited ---\"; read -r'" >/dev/null 2>&1 &
     disown
   else
-    echo "Warning: no terminal emulator found for reward monitor. Install xfce4-terminal or xterm."
+    echo "Warning: no terminal emulator found for reward monitor. Starting plot monitor in the background."
+    bash -lc "$monitor_cmd" >/dev/null 2>&1 &
+    disown
   fi
 }
 

@@ -4,6 +4,8 @@ import getopt
 import os
 import time
 import numpy as np
+import threading
+import queue
 PI= 3.14159265359
 
 data_size = 2**17
@@ -33,6 +35,8 @@ ophelp+= ' --gear-model-file <path>     File for gear network weights.\n'
 ophelp+= ' --epsilon <float>    Maximum epsilon for exploration in Q-learning. Actual per-episode epsilon is sampled between 0.0 and this value. [0.1]\n'
 ophelp+= ' --gamma <float>      Discount factor for Q-learning. [0.99]\n'
 ophelp+= ' --train-fast         Enable fast training mode (reduced output, shorter episodes, smaller networks).\n'
+ophelp+= ' --reward-window      Open a realtime reward plot window.\n'
+ophelp+= ' --human-feedback     Enable human feedback buttons in the reward monitor.\n'
 ophelp+= ' --novision           Disable vision from TORCS.\n'
 ophelp+= ' --debug, -d          Output full telemetry.\n'
 ophelp+= ' --help, -h           Show this help.\n'
@@ -107,6 +111,8 @@ class Client():
         self.epsilon = 0.1
         self.gamma = 0.99
         self.train_fast = False
+        self.reward_window = False
+        self.human_feedback = False
         self.parse_the_command_line()
         if self.train and not any([self.train_steer, self.train_throttle, self.train_gear]):
             self.train_steer = True
@@ -171,16 +177,16 @@ class Client():
     def parse_the_command_line(self):
         try:
             (opts, args) = getopt.getopt(sys.argv[1:], 'H:p:i:m:e:t:s:dhv',
-                       ['host=','port=','id=','steps=',
-                        'episodes=','track=','stage=',
-                        'mode=','model-file=','train',
-                        'train-steer','train-throttle','train-gear',
-                        'fixed-steer','fixed-throttle','fixed-gear',
-                        'load-model','save-model',
-                        'steer-model-file=','throttle-model-file=','gear-model-file=',
-                        'epsilon=','gamma=',
-                        'train-fast',
-                        'debug','help','version', 'novision'])
+                              ['host=','port=','id=','steps=',
+                                'episodes=','track=','stage=',
+                                'mode=','model-file=','train',
+                                'train-steer','train-throttle','train-gear',
+                                'fixed-steer','fixed-throttle','fixed-gear',
+                                'load-model','save-model',
+                                'steer-model-file=','throttle-model-file=','gear-model-file=',
+                                'epsilon=','gamma=',
+                                    'train-fast','reward-window','human-feedback',
+                                     'debug','help','version', 'novision'])
         except getopt.error as why:
             print('getopt error: %s\n%s' % (why, usage))
             sys.exit(-1)
@@ -239,14 +245,17 @@ class Client():
                     self.gamma = float(opt[1])
                 if opt[0] == '--train-fast':
                     self.train_fast = True
+                if opt[0] == '--reward-window':
+                    self.reward_window = True
+                if opt[0] == '--human-feedback':
+                    self.human_feedback = True
                 if opt[0] == '--novision':
                     self.vision = True
                 if opt[0] == '-v' or opt[0] == '--version':
                     print('%s %s' % (sys.argv[0], version))
                     sys.exit(0)
         except ValueError as why:
-            print('Bad parameter \'%s\' for option %s: %s\n%s' % (
-                                       opt[1], opt[0], why, usage))
+            print('Bad parameter \'%s\' for option %s: %s\n%s' % (opt[1], opt[0], why, usage))
             sys.exit(-1)
         if len(args) > 0:
             print('Superflous input? %s\n%s' % (', '.join(args), usage))
@@ -926,7 +935,7 @@ def apply_gear(R, action):
 # Reward functions for separate networks
 # --------------------------------------
 def compute_reward_steer(S, prev_S=None):
-    reward = -abs(S['angle']) * 2.0 - abs(S['trackPos']) * 1.0
+    reward = - abs(S['trackPos']) * 1.0
     invalid = False
     if prev_S is not None:
         reward += (S['distFromStart'] - prev_S['distFromStart']) * 0.1
@@ -1020,6 +1029,12 @@ EPSILON_DECAY_RATE = 0.98
 # Global training step counter file for proper exploration tracking across sessions
 GLOBAL_STEPS_FILE = '.training_global_steps.json'
 
+# Reward monitor globals (set when --reward-window is enabled)
+REWARD_MONITOR_QUEUE = None
+REWARD_MONITOR_THREAD = None
+REWARD_MONITOR_STOP = None
+FEEDBACK_QUEUE = None
+
 
 def load_global_steps():
     """Load global episode counter (completed episodes) from file. Returns 0 if file doesn't exist."""
@@ -1041,6 +1056,105 @@ def save_global_steps(global_episodes):
             json.dump({'global_episodes': global_episodes}, f)
     except (IOError, OSError) as e:
         print(f'Warning: Could not save global episodes: {e}')
+
+
+def _reward_plotter_thread(q, stop_event):
+    """Background thread: open a matplotlib window and plot rewards from queue in realtime."""
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        print('Reward monitor: matplotlib not available:', e)
+        return
+
+    plt.ion()
+    fig, ax = plt.subplots()
+    ax.set_title('Realtime Reward per Step')
+    ax.set_xlabel('Step')
+    ax.set_ylabel('Reward')
+    line, = ax.plot([], [], '-b')
+    rewards = []
+    maxlen = 2000
+
+    # Setup optional human-feedback buttons
+    try:
+        from matplotlib.widgets import Button
+        have_buttons = True
+    except Exception:
+        have_buttons = False
+
+    feedback_axes = None
+    if have_buttons:
+        # Add two buttons: + and - to let operator give feedback
+        axup = fig.add_axes([0.80, 0.02, 0.08, 0.05])
+        axdown = fig.add_axes([0.69, 0.02, 0.08, 0.05])
+        btn_up = Button(axup, '+')
+        btn_down = Button(axdown, '-')
+        def on_up(event):
+            try:
+                FEEDBACK_QUEUE.put_nowait(1.0)
+            except Exception:
+                pass
+        def on_down(event):
+            try:
+                FEEDBACK_QUEUE.put_nowait(-1.0)
+            except Exception:
+                pass
+        btn_up.on_clicked(on_up)
+        btn_down.on_clicked(on_down)
+
+    while not stop_event.is_set():
+        try:
+            while True:
+                r = q.get_nowait()
+                rewards.append(r)
+                if len(rewards) > maxlen:
+                    rewards.pop(0)
+        except queue.Empty:
+            pass
+
+        if rewards:
+            xs = list(range(len(rewards)))
+            line.set_data(xs, rewards)
+            ax.relim()
+            ax.autoscale_view()
+            try:
+                fig.canvas.draw()
+                fig.canvas.flush_events()
+            except Exception:
+                pass
+
+        time.sleep(0.05)
+
+    try:
+        plt.ioff()
+        plt.show(block=False)
+    except Exception:
+        pass
+
+
+def start_reward_monitor():
+    global REWARD_MONITOR_QUEUE, REWARD_MONITOR_THREAD, REWARD_MONITOR_STOP
+    if REWARD_MONITOR_QUEUE is not None:
+        return
+    global FEEDBACK_QUEUE
+    REWARD_MONITOR_QUEUE = queue.Queue(maxsize=8192)
+    FEEDBACK_QUEUE = queue.Queue(maxsize=1024)
+    REWARD_MONITOR_STOP = threading.Event()
+    REWARD_MONITOR_THREAD = threading.Thread(target=_reward_plotter_thread, args=(REWARD_MONITOR_QUEUE, REWARD_MONITOR_STOP), daemon=True)
+    REWARD_MONITOR_THREAD.start()
+
+
+def stop_reward_monitor():
+    global REWARD_MONITOR_QUEUE, REWARD_MONITOR_THREAD, REWARD_MONITOR_STOP
+    if REWARD_MONITOR_QUEUE is None:
+        return
+    REWARD_MONITOR_STOP.set()
+    REWARD_MONITOR_THREAD.join(timeout=2.0)
+    REWARD_MONITOR_QUEUE = None
+    REWARD_MONITOR_THREAD = None
+    REWARD_MONITOR_STOP = None
+    global FEEDBACK_QUEUE
+    FEEDBACK_QUEUE = None
 
 
 def compute_reward(S, prev_S=None):
@@ -1083,10 +1197,11 @@ def compute_reward(S, prev_S=None):
         steering_penalty = (angle_magnitude - 0.2) * 500.0  # NEW: sharp turns are bad
         reward -= steering_penalty
     
-    # TRACK POSITION: Heavy penalty for being off-center (should be on track)
-    track_pos_penalty = abs(S['trackPos']) * 200.0  # Increased from 20 to 200!
-    reward -= track_pos_penalty
-    
+    # TRACK POSITION: Penalty for being off-center while still on track
+    if on_track:
+        track_pos_penalty = (abs(S['trackPos']) ** 2) * 20.0
+        reward -= track_pos_penalty
+
     # WALL PROXIMITY: Severe penalty for getting too close to walls
     closest_wall = min(S['track'])
     if closest_wall < WALL_PROXIMITY_THRESHOLD:
@@ -1130,7 +1245,35 @@ def compute_reward(S, prev_S=None):
         elif delta_dist < SLOW_MOVEMENT_DISTANCE_THRESHOLD or S['speedX'] < SLOW_MOVEMENT_SPEED_THRESHOLD:
             reward -= 30.0  # Too slow
     
-    return reward, invalid
+    # Human feedback: drain any feedback inputs and add to reward (unscaled)
+    try:
+        if FEEDBACK_QUEUE is not None:
+            add = 0.0
+            while True:
+                try:
+                    add += FEEDBACK_QUEUE.get_nowait()
+                except queue.Empty:
+                    break
+            if add != 0.0:
+                # apply feedback (log it)
+                reward += add * 1.0
+                print('Applied human feedback:', add)
+    except Exception:
+        pass
+
+    # Reward normalization / clipping for stable learning
+    # Scale into [-1, 1] via tanh using REWARD_SCALE
+    REWARD_SCALE = 5000.0
+    normalized = float(np.tanh(reward / REWARD_SCALE))
+
+    # Emit normalized reward to monitor queue if enabled (non-blocking)
+    try:
+        if REWARD_MONITOR_QUEUE is not None:
+            REWARD_MONITOR_QUEUE.put_nowait(normalized)
+    except Exception:
+        pass
+
+    return normalized, invalid
 
 
 
@@ -1289,6 +1432,14 @@ if __name__ == "__main__":
         steer_net = load_network(steer_file) if not C.fixed_steer else None
         throttle_net = load_network(throttle_file) if not C.fixed_throttle else None
         gear_net = load_network(gear_file) if not C.fixed_gear else None
+
+    # Start in-process reward monitor if requested
+    if C.reward_window:
+        try:
+            start_reward_monitor()
+            print('Reward monitor started')
+        except Exception as e:
+            print('Failed to start reward monitor:', e)
 
     hidden_dim = 64  # Always use full network size for final models
     # Optimize learning rates per task: steering is most critical (low lr), throttle moderate, gear flexible
@@ -1487,5 +1638,10 @@ if __name__ == "__main__":
         print(f'Saved global training episodes: {global_episodes}')
 
     C.shutdown()
+    # Stop reward monitor if running
+    try:
+        stop_reward_monitor()
+    except Exception:
+        pass
     if C.train:
         os.system('pkill torcs')
